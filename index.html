@@ -325,8 +325,19 @@ async function apiGet(){
 }
 async function apiPost(payload){
   payload.senha = senhaMaster;
-  const r = await fetch(API_URL, { method:'POST', body: JSON.stringify(payload) });
-  return r.json();
+  let r;
+  try{
+    r = await fetch(API_URL, { method:'POST', body: JSON.stringify(payload) });
+  }catch(e){
+    throw new Error('Sem resposta do servidor. Verifique a internet e se a URL do Apps Script está correta.');
+  }
+  const texto = await r.text();
+  try{ return JSON.parse(texto); }
+  catch(e){
+    if(texto.indexOf('accounts.google') > -1 || texto.indexOf('ServiceLogin') > -1)
+      throw new Error('O Apps Script está pedindo login. Reimplante com acesso "Qualquer pessoa".');
+    throw new Error('Resposta inesperada do Apps Script (HTTP '+r.status+'). Reimplante como "Nova versão".');
+  }
 }
 
 /* ===================== sincronização ===================== */
@@ -453,7 +464,7 @@ async function entrarMaster(){
   try{
     const j = await apiPost({action:'ping'});
     if(!j.ok){ $('senhaErro').textContent = j.erro || 'Senha incorreta'; return; }
-  }catch(e){ $('senhaErro').textContent = 'Erro de conexão'; return; }
+  }catch(e){ $('senhaErro').textContent = '⚠️ ' + e.message; return; }
   modoMaster = true;
   $('telaGate').classList.add('hide');
   $('telaMaster').classList.remove('hide');
