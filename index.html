@@ -231,7 +231,7 @@
       </div>
       <p class="muted" style="margin-top:8px">
         “Transmitir” reinicia a rádio do começo da lista em todas as lojas, ao mesmo tempo.
-        A programação repete em loop até você parar ou transmitir de novo. Ao importar novos avisos, clique em "Aplicar" de novo para incluí-los no rodízio.
+        A programação repete em loop até você parar ou transmitir de novo. A ordem das músicas é sorteada de novo a cada volta — nunca repete a mesma sequência. Avisos importados entram no rodízio automaticamente.
       </p>
     </div>
 
@@ -257,10 +257,9 @@
       <div class="card">
         <h2>Programação (ordem de reprodução)</h2>
         <div class="row" style="margin-bottom:10px">
-          <span class="muted">Inserir 1 aviso a cada</span>
-          <input type="number" id="cadaN" value="3" min="1" style="width:64px">
-          <span class="muted">músicas</span>
-          <button class="mini" onclick="autoInserirAvisos()">Aplicar</button>
+          <span class="muted">🔀 Ordem sempre aleatória (muda a cada volta) · 1 aviso a cada</span>
+          <input type="number" id="cadaN" value="3" min="1" style="width:64px" onchange="salvarRascunho()">
+          <span class="muted">músicas, em rodízio</span>
           <button class="mini" onclick="limparProgramacao()">Limpar</button>
         </div>
         <ul class="prog-list" id="progList"></ul>
@@ -367,18 +366,69 @@ async function apiPost(payload){
 }
 
 /* ===================== sincronização ===================== */
-function posicaoAtual(){
-  if(!estado || estado.status!=='on' || !estado.playlist || !estado.playlist.length) return null;
-  const total = estado.playlist.reduce((s,t)=>s+(t.dur||0),0);
-  if(total<=0) return null;
-  let elapsed = ((agora() - estado.startEpoch)/1000) % total;
-  if(elapsed<0) elapsed = 0;
-  for(let i=0;i<estado.playlist.length;i++){
-    const d = estado.playlist[i].dur||0;
-    if(elapsed < d) return { index:i, seek:elapsed, total, faixa:estado.playlist[i] };
-    elapsed -= d;
+/* embaralhamento determinístico: todas as lojas calculam a MESMA ordem
+   aleatória para cada volta, sem trocar mensagens entre si */
+function mulberry32(a){
+  return function(){
+    a|=0; a=(a+0x6D2B79F5)|0;
+    let t=Math.imul(a^(a>>>15),1|a);
+    t=(t+Math.imul(t^(t>>>7),61|t))^t;
+    return ((t^(t>>>14))>>>0)/4294967296;
+  };
+}
+function shuffleSeed(arr, seed){
+  const a = arr.slice(), rnd = mulberry32(seed);
+  for(let i=a.length-1;i>0;i--){
+    const j = Math.floor(rnd()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
   }
-  return { index:0, seek:0, total, faixa:estado.playlist[0] };
+  return a;
+}
+function poolUnico(){
+  const vistos = {}, pool = [];
+  (estado.playlist||[]).forEach(t=>{ if(!vistos[t.id]){ vistos[t.id]=1; pool.push(t); } });
+  return pool;
+}
+function montarCiclo(c){
+  const pool = poolUnico();
+  const mus = pool.filter(t=>t.tipo!=='aviso');
+  const avi = pool.filter(t=>t.tipo==='aviso');
+  if(!mus.length) return [];
+  const K = Math.max(1, estado.avisoCada||3);
+  const ms = shuffleSeed(mus, (estado.version||1)*9973 + c*7919 + 12345);
+  const slots = avi.length ? Math.floor(ms.length/K) : 0;
+  let ai = avi.length ? (c*slots) % avi.length : 0;
+  const seq = [];
+  ms.forEach((m,i)=>{
+    seq.push(m);
+    if(avi.length && (i+1)%K===0){ seq.push(avi[ai%avi.length]); ai++; }
+  });
+  return seq;
+}
+function durSeq(seq){ return seq.reduce((s,t)=>s+(t.dur||0),0); }
+
+function posicaoAtual(){
+  if(!estado || estado.status!=='on') return null;
+  let elapsed = (agora() - estado.startEpoch)/1000;
+  if(elapsed<0) elapsed = 0;
+  let c=0, seq=montarCiclo(0), d=durSeq(seq);
+  if(d<=0) return null;
+  let guarda=0;
+  while(elapsed >= d && guarda++ < 200000){
+    elapsed -= d; c++;
+    seq = montarCiclo(c); d = durSeq(seq);
+    if(d<=0) return null;
+  }
+  for(let i=0;i<seq.length;i++){
+    if(elapsed < (seq[i].dur||0)) return { index:i, seek:elapsed, faixa:seq[i], seq, ciclo:c };
+    elapsed -= (seq[i].dur||0);
+  }
+  return { index:0, seek:0, faixa:seq[0], seq, ciclo:c };
+}
+function proximaFaixa(pos){
+  if(pos.index+1 < pos.seq.length) return pos.seq[pos.index+1];
+  const prox = montarCiclo(pos.ciclo+1);
+  return prox.length ? prox[0] : pos.seq[0];
 }
 
 /* ===================== MODO LOJA ===================== */
@@ -431,7 +481,7 @@ function sincronizarPlayer(forcar){
   b.classList.remove('hide','aviso','musica');
   b.classList.add(pos.faixa.tipo);
   b.textContent = pos.faixa.tipo==='aviso' ? '📢 aviso' : '🎵 música';
-  const prox = estado.playlist[(pos.index+1)%estado.playlist.length];
+  const prox = proximaFaixa(pos);
   $('nowNext').textContent = 'A seguir: ' + limparNome(prox.nome);
   $('barraFill').style.width = (pos.seek/(pos.faixa.dur||1)*100).toFixed(1)+'%';
 
@@ -516,9 +566,10 @@ function falhaAudio(){
 // baixa a próxima faixa em segundo plano para o cache local (troca instantânea)
 function prefetchProxima(){
   const pos = posicaoAtual();
-  if(!pos || estado.playlist.length < 2) return;
-  const prox = estado.playlist[(pos.index+1) % estado.playlist.length];
-  obterAudioURL(prox, false).then(u=>URL.revokeObjectURL(u)).catch(()=>{});
+  if(!pos) return;
+  const prox = proximaFaixa(pos);
+  if(prox && prox.id !== pos.faixa.id)
+    obterAudioURL(prox, false).then(u=>URL.revokeObjectURL(u)).catch(()=>{});
 }
 
 // se o navegador bloquear o autoplay, qualquer toque libera
@@ -641,6 +692,7 @@ async function entrarMaster(){
   $('telaMaster').classList.remove('hide');
   await apiGet();
   programacao = (estado.playlist||[]).map(t=>t.id);
+  if(estado.avisoCada) $('cadaN').value = estado.avisoCada;
   renderMaster();
   iniciarPolling();
   setInterval(renderStatusMaster, 1000);
@@ -785,9 +837,18 @@ function renderMaster(){
       `<span class="tname" title="Clique para testar o áudio direto do Drive"><a href="https://drive.google.com/uc?export=media&id=${t.fid}" target="_blank" style="color:inherit;text-decoration:none">${limparNome(t.nome)}</a></span>`+
       `<span class="tdur">${fmt(t.dur)}</span>`+
       `<button class="mini" title="Adicionar à programação">＋</button>`+
+      `<button class="mini" title="Renomear">✏️</button>`+
       `<button class="mini danger" title="Excluir da biblioteca">✕</button>`;
     li.children[3].onclick = ()=>{ programacao.push(t.id); renderMaster(); salvarRascunho(); };
     li.children[4].onclick = async ()=>{
+      const novo = prompt('Novo nome para a faixa:', limparNome(t.nome));
+      if(novo === null) return;
+      if(!novo.trim()){ toast('O nome não pode ficar vazio'); return; }
+      const j = await apiPost({action:'renameTrack', id:t.id, novoNome:novo.trim()});
+      if(j.ok){ await apiGet(); renderMaster(); toast('✏️ Faixa renomeada'); }
+      else toast('Erro: '+(j.erro||''));
+    };
+    li.children[5].onclick = async ()=>{
       if(!confirm('Excluir "'+limparNome(t.nome)+'" da biblioteca?')) return;
       await apiPost({action:'deleteTrack', id:t.id});
       await apiGet();
@@ -802,13 +863,9 @@ function renderMaster(){
   programacao = programacao.filter(id=>map[id]);
   const pl = $('progList'); pl.innerHTML='';
   $('progVazia').style.display = programacao.length ? 'none':'block';
-  const posAr = posicaoAtual();
   programacao.forEach((id,i)=>{
     const t = map[id];
     const li = document.createElement('li');
-    if(posAr && estado.status==='on' && estado.playlist[posAr.index] && estado.playlist[posAr.index].id===id
-       && JSON.stringify((estado.playlist||[]).map(x=>x.id))===JSON.stringify(programacao) && posAr.index===i)
-      li.classList.add('playing-now');
     li.innerHTML =
       `<span class="num">${i+1}</span>`+
       `<span class="tico">${t.tipo==='aviso'?'📢':'🎵'}</span>`+
@@ -844,23 +901,6 @@ function salvarRascunho(){
   rascunhoTimer = setTimeout(()=>apiPost({action:'saveOrder', order:programacao}).catch(()=>{}), 1200);
 }
 
-function autoInserirAvisos(){
-  const n = Math.max(1, parseInt($('cadaN').value)||3);
-  const map={}; biblioteca.forEach(t=>map[t.id]=t);
-  const musicas = programacao.filter(id=>map[id] && map[id].tipo==='musica');
-  const avisos  = biblioteca.filter(t=>t.tipo==='aviso').map(t=>t.id);
-  if(!musicas.length){ toast('Adicione músicas à programação primeiro'); return; }
-  if(!avisos.length){ toast('Nenhum aviso na biblioteca'); return; }
-  const nova=[]; let a=0;
-  musicas.forEach((id,i)=>{
-    nova.push(id);
-    if((i+1)%n===0){ nova.push(avisos[a%avisos.length]); a++; }
-  });
-  programacao = nova;
-  renderMaster(); salvarRascunho();
-  toast('Avisos inseridos a cada '+n+' músicas');
-}
-
 function limparProgramacao(){
   if(!confirm('Limpar toda a programação?')) return;
   programacao=[]; renderMaster(); salvarRascunho();
@@ -869,7 +909,8 @@ function limparProgramacao(){
 async function transmitir(){
   if(!programacao.length){ toast('A programação está vazia'); return; }
   $('btnTransmitir').disabled = true;
-  const j = await apiPost({action:'broadcast', order:programacao});
+  const j = await apiPost({action:'broadcast', order:programacao,
+                           avisoCada: Math.max(1, parseInt($('cadaN').value)||3)});
   $('btnTransmitir').disabled = false;
   if(j.ok){ await apiGet(); renderMaster(); toast('📡 Transmitindo em todas as lojas!'); }
   else toast('Erro: '+(j.erro||''));
