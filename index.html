@@ -285,6 +285,24 @@
 <div class="toast" id="toast"></div>
 
 <script>
+/* conversor MP3 (lamejs) — tenta 3 CDNs; se nenhum carregar, o upload segue sem conversão */
+(function(){
+  const cdns = [
+    'https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js',
+    'https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js',
+    'https://unpkg.com/lamejs@1.2.1/lame.min.js'
+  ];
+  let i = 0;
+  (function tenta(){
+    if(i >= cdns.length) return;
+    const s = document.createElement('script');
+    s.src = cdns[i++];
+    s.onerror = tenta;
+    document.head.appendChild(s);
+  })();
+})();
+</script>
+<script>
 /* =====================================================================
    CONFIGURAÇÃO — cole aqui a URL do App da Web (Apps Script)
 ===================================================================== */
@@ -566,10 +584,22 @@ function processarFila(){
 async function enviarUm({f, tipo, li}){
   const st = li.querySelector('.up-st');
   try{
-    st.textContent = 'preparando…';
-    const [dur, b64] = await Promise.all([ medirDuracao(f), paraBase64(f, null) ]);
+    let nome = f.name, mime = f.type || 'audio/mpeg', dur = 0, blobFinal = f;
+
+    // converte qualquer formato de áudio para MP3 padrão (resolve .mpeg, .m4a, .wav…)
+    const conv = await converterParaMp3(f, st);
+    if(conv){
+      blobFinal = conv.blob;
+      dur = conv.dur;
+      nome = nome.replace(/\.[a-z0-9]{2,5}$/i,'') + '.mp3';
+      mime = 'audio/mpeg';
+    } else {
+      dur = await medirDuracao(f);
+    }
+
     st.textContent = 'enviando…';
-    const j = await apiPost({action:'upload', nome:f.name, tipo, dur, mime:f.type||'audio/mpeg', b64});
+    const b64 = await paraBase64(blobFinal, null);
+    const j = await apiPost({action:'upload', nome, tipo, dur, mime, b64});
     if(j.ok){
       st.textContent = '✅ ok';
       await apiGet();
@@ -581,6 +611,43 @@ async function enviarUm({f, tipo, li}){
   }catch(e){
     st.textContent = '❌ erro de envio';
   }
+}
+
+async function converterParaMp3(file, st){
+  if(typeof lamejs === 'undefined') return null;   // CDN não carregou: envia original
+  let audioBuf;
+  try{
+    st.textContent = 'lendo áudio…';
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    audioBuf = await ctx.decodeAudioData(await file.arrayBuffer());
+    ctx.close();
+  }catch(e){ return null; }                        // formato ilegível: envia original
+
+  st.textContent = 'convertendo…';
+  const canais = Math.min(2, audioBuf.numberOfChannels);
+  const enc = new lamejs.Mp3Encoder(canais, audioBuf.sampleRate, 160);
+  const toInt16 = f32 => {
+    const out = new Int16Array(f32.length);
+    for(let i=0;i<f32.length;i++){
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = s < 0 ? s*0x8000 : s*0x7FFF;
+    }
+    return out;
+  };
+  const L = toInt16(audioBuf.getChannelData(0));
+  const R = canais > 1 ? toInt16(audioBuf.getChannelData(1)) : null;
+
+  const bloco = 1152, partes = [];
+  for(let i=0;i<L.length;i+=bloco){
+    const buf = R
+      ? enc.encodeBuffer(L.subarray(i,i+bloco), R.subarray(i,i+bloco))
+      : enc.encodeBuffer(L.subarray(i,i+bloco));
+    if(buf.length) partes.push(new Int8Array(buf));
+    if((i/bloco) % 400 === 0) await new Promise(r=>setTimeout(r,0)); // não trava a tela
+  }
+  const fim = enc.flush();
+  if(fim.length) partes.push(new Int8Array(fim));
+  return { blob: new Blob(partes, {type:'audio/mpeg'}), dur: Math.round(audioBuf.duration*10)/10 };
 }
 
 function medirDuracao(file){
