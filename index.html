@@ -449,50 +449,76 @@ function sincronizarPlayer(forcar){
   if(!audio.paused && !audio.error) $('lojaStatus').textContent = 'No ar agora';
 }
 
-function carregarAudio(pos){
-  clearTimeout(watchdogAudio);
-  const mk = FONTES_AUDIO[fonteTent % FONTES_AUDIO.length];
-  $('lojaStatus').textContent = 'Carregando áudio…';
-  audio.onloadedmetadata = () => {
-    clearTimeout(watchdogAudio);
-    fonteOk = fonteTent % FONTES_AUDIO.length;
-    const p2 = posicaoAtual();
-    if(p2 && p2.faixa.id === faixaTocandoId){
-      try{ audio.currentTime = Math.min(p2.seek, Math.max(0, audio.duration - 0.5)); }catch(e){}
+const CACHE_AUDIO = 'radio-miashop-v1';
+let urlObjAtual = null;
+const baixando = {};   // evita baixar a mesma faixa duas vezes ao mesmo tempo
+
+async function obterAudioURL(faixa, avisarStatus){
+  const chave = 'https://radio.miashop.local/faixa/' + faixa.fid;
+  let cache = null;
+  try{ cache = await caches.open(CACHE_AUDIO); }catch(e){}
+
+  if(cache){
+    const hit = await cache.match(chave);
+    if(hit) return URL.createObjectURL(await hit.blob());
+  }
+
+  if(baixando[faixa.fid]) return baixando[faixa.fid];
+
+  baixando[faixa.fid] = (async ()=>{
+    if(avisarStatus) $('lojaStatus').textContent = 'Baixando faixa (só na primeira vez)…';
+    const r = await fetch(API_URL + '?action=audio&id=' + faixa.fid + '&t=' + Date.now());
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.erro || 'falha no download');
+    const bin = atob(j.b64);
+    const arr = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
+    const blob = new Blob([arr], {type: j.mime || 'audio/mpeg'});
+    if(cache){
+      try{ await cache.put(chave, new Response(blob, {headers:{'Content-Type': blob.type}})); }catch(e){}
     }
-    audio.play().then(()=>{ $('lojaStatus').textContent = 'No ar agora'; prefetchProxima(); })
-      .catch(()=>{ $('lojaStatus').textContent = '👆 Toque em qualquer lugar para liberar o som'; });
-  };
-  audio.src = mk(pos.faixa.fid);
-  watchdogAudio = setTimeout(falhaAudio, 12000);
-  audio.load();
+    return URL.createObjectURL(blob);
+  })();
+
+  try{ return await baixando[faixa.fid]; }
+  finally{ delete baixando[faixa.fid]; }
+}
+
+async function carregarAudio(pos){
+  clearTimeout(watchdogAudio);
+  try{
+    const url = await obterAudioURL(pos.faixa, true);
+    if(faixaTocandoId !== pos.faixa.id){ URL.revokeObjectURL(url); return; }
+    if(urlObjAtual) URL.revokeObjectURL(urlObjAtual);
+    urlObjAtual = url;
+    audio.onloadedmetadata = () => {
+      const p2 = posicaoAtual();
+      if(p2 && p2.faixa.id === faixaTocandoId){
+        try{ audio.currentTime = Math.min(p2.seek, Math.max(0, audio.duration - 0.5)); }catch(e){}
+      }
+      audio.play().then(()=>{ $('lojaStatus').textContent = 'No ar agora'; prefetchProxima(); })
+        .catch(()=>{ $('lojaStatus').textContent = '👆 Toque em qualquer lugar para liberar o som'; });
+    };
+    audio.src = url;
+    audio.load();
+  }catch(e){
+    $('lojaStatus').textContent = '⚠️ Falha ao baixar a faixa — tentando de novo…';
+    setTimeout(()=>{ if(lojaAtiva) sincronizarPlayer(true); }, 8000);
+  }
 }
 
 function falhaAudio(){
   if(!lojaAtiva || !faixaTocandoId) return;
-  clearTimeout(watchdogAudio);
   const pos = posicaoAtual();
-  if(!pos) return;
-  fonteTent++;
-  if(fonteTent - fonteOk >= FONTES_AUDIO.length){
-    $('lojaStatus').textContent = '⚠️ Áudio bloqueado — no Master, use "Corrigir compartilhamento"';
-    fonteTent = fonteOk;
-    setTimeout(()=>{ if(lojaAtiva) sincronizarPlayer(true); }, 10000);
-    return;
-  }
-  carregarAudio(pos);
+  if(pos) carregarAudio(pos);
 }
 
-// aquece o cache do navegador com a próxima faixa (troca mais rápida)
-const prefetcher = new Audio();
-prefetcher.preload = 'auto';
-prefetcher.muted = true;
+// baixa a próxima faixa em segundo plano para o cache local (troca instantânea)
 function prefetchProxima(){
   const pos = posicaoAtual();
   if(!pos || estado.playlist.length < 2) return;
   const prox = estado.playlist[(pos.index+1) % estado.playlist.length];
-  const url = FONTES_AUDIO[fonteOk](prox.fid);
-  if(prefetcher.src !== url){ prefetcher.src = url; prefetcher.load(); }
+  obterAudioURL(prox, false).then(u=>URL.revokeObjectURL(u)).catch(()=>{});
 }
 
 // se o navegador bloquear o autoplay, qualquer toque libera
@@ -558,14 +584,19 @@ async function rodarDiagnostico(){
             ' | volume: ' + Math.round(audio.volume*100) + '%' + (audio.muted ? ' (MUDO!)' : ''));
   if(audio.error) diagLinha('   ❌ erro do player: código ' + audio.error.code);
 
-  // 4) testa cada endereço do Drive para a faixa atual
+  // 4) testa o download da faixa pelo canal do sistema
   if(pos){
     diagLinha('');
-    diagLinha('4) Testando os 3 endereços do Google Drive:');
-    for(let i=0;i<FONTES_AUDIO.length;i++){
-      diagLinha('   Endereço '+(i+1)+': testando…');
-      const r = await testarFonte(FONTES_AUDIO[i](pos.faixa.fid));
-      b.textContent = b.textContent.replace('Endereço '+(i+1)+': testando…','Endereço '+(i+1)+': '+r);
+    diagLinha('4) Baixando a faixa atual pelo sistema…');
+    try{
+      const t0 = Date.now();
+      const u = await obterAudioURL(pos.faixa, false);
+      diagLinha('   ✅ download ok em ' + Math.round((Date.now()-t0)/100)/10 + 's');
+      const r = await testarFonte(u);
+      diagLinha('   Reprodução: ' + r + (r.indexOf('❌')===0 ? ' → o ARQUIVO não é um áudio válido; exclua e importe de novo' : ''));
+      URL.revokeObjectURL(u);
+    }catch(e){
+      diagLinha('   ❌ falha no download: ' + e.message);
     }
     diagLinha('');
     diagLinha('→ Tire um print desta caixa e envie para o suporte (Claude).');
