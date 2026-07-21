@@ -268,6 +268,18 @@
         </p>
       </div>
     </div>
+
+    <div class="card">
+      <h2>Segurança</h2>
+      <div class="row">
+        <input type="password" id="novaSenha" placeholder="Nova senha master" style="flex:1;min-width:180px" autocomplete="new-password">
+        <input type="password" id="novaSenha2" placeholder="Confirmar nova senha" style="flex:1;min-width:180px" autocomplete="new-password">
+        <button onclick="alterarSenha()">🔑 Alterar senha</button>
+      </div>
+      <p class="muted" style="margin-top:8px">
+        A nova senha vale imediatamente para qualquer computador que acessar o modo Master.
+      </p>
+    </div>
   </div>
 
 </div>
@@ -608,6 +620,19 @@ async function transmitir(){
 async function pararTransmissao(){
   const j = await apiPost({action:'stop'});
   if(j.ok){ await apiGet(); renderMaster(); audio.pause(); previaAtiva=false; toast('Transmissão encerrada'); }
+}
+
+async function alterarSenha(){
+  const n1 = $('novaSenha').value.trim();
+  const n2 = $('novaSenha2').value.trim();
+  if(n1.length < 4){ toast('A nova senha precisa ter ao menos 4 caracteres'); return; }
+  if(n1 !== n2){ toast('As senhas não conferem'); return; }
+  const j = await apiPost({action:'changePassword', novaSenha:n1});
+  if(j.ok){
+    senhaMaster = n1;
+    $('novaSenha').value = ''; $('novaSenha2').value = '';
+    toast('🔑 Senha master alterada');
+  } else toast('Erro: '+(j.erro||''));
 }
 
 /* prévia local no master (ouve o mesmo ponto das lojas) */
