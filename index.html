@@ -201,7 +201,7 @@
       <div id="barra"><div id="barraFill"></div></div>
       <button class="primary big-play" id="btnEntrar" onclick="entrarRadio()">▶ &nbsp;Entrar na rádio</button>
       <div class="vol hide" id="volBox">
-        🔈 <input type="range" min="0" max="100" value="100" id="volSlider" oninput="audio.volume=this.value/100"> 🔊
+        🔈 <input type="range" min="0" max="100" value="100" id="volSlider" oninput="setVolume(this.value/100)"> 🔊
       </div>
       <div style="margin-top:18px">
         <button class="mini" onclick="rodarDiagnostico()">🩺 Diagnóstico de som</button>
@@ -405,25 +405,37 @@ function montarCiclo(c){
   });
   return seq;
 }
-function durSeq(seq){ return seq.reduce((s,t)=>s+(t.dur||0),0); }
+const FADE_X = 3.5;   // segundos de transição (crossfade) entre faixas
+
+/* linha do tempo da volta: cada faixa começa FADE antes da anterior acabar,
+   e nesse intervalo as duas tocam juntas (uma desce, a outra sobe) */
+function linhaDoTempo(seq){
+  const S=[0], f=[];
+  for(let i=0;i<seq.length-1;i++){
+    const fi = Math.max(0, Math.min(FADE_X, (seq[i].dur||0)/3, (seq[i+1].dur||0)/3));
+    f.push(fi);
+    S.push(S[i] + (seq[i].dur||0) - fi);
+  }
+  f.push(0);  // a última faixa da volta termina limpa
+  const D = seq.length ? S[seq.length-1] + (seq[seq.length-1].dur||0) : 0;
+  return { S, f, D };
+}
 
 function posicaoAtual(){
   if(!estado || estado.status!=='on') return null;
   let elapsed = (agora() - estado.startEpoch)/1000;
   if(elapsed<0) elapsed = 0;
-  let c=0, seq=montarCiclo(0), d=durSeq(seq);
-  if(d<=0) return null;
+  let c=0, seq=montarCiclo(0), tl=linhaDoTempo(seq);
+  if(tl.D<=0) return null;
   let guarda=0;
-  while(elapsed >= d && guarda++ < 200000){
-    elapsed -= d; c++;
-    seq = montarCiclo(c); d = durSeq(seq);
-    if(d<=0) return null;
+  while(elapsed >= tl.D && guarda++ < 200000){
+    elapsed -= tl.D; c++;
+    seq = montarCiclo(c); tl = linhaDoTempo(seq);
+    if(tl.D<=0) return null;
   }
-  for(let i=0;i<seq.length;i++){
-    if(elapsed < (seq[i].dur||0)) return { index:i, seek:elapsed, faixa:seq[i], seq, ciclo:c };
-    elapsed -= (seq[i].dur||0);
-  }
-  return { index:0, seek:0, faixa:seq[0], seq, ciclo:c };
+  let i = seq.length-1;
+  for(let k=0;k<seq.length-1;k++){ if(elapsed < tl.S[k+1]){ i=k; break; } }
+  return { index:i, seek: elapsed - tl.S[i], faixa: seq[i], seq, ciclo:c, tl };
 }
 function proximaFaixa(pos){
   if(pos.index+1 < pos.seq.length) return pos.seq[pos.index+1];
@@ -447,6 +459,7 @@ async function entrarRadio(){
   try{
     await apiGet();
     lojaAtiva = true;
+    masterVol = ($('volSlider').value||100)/100;
     $('btnEntrar').classList.add('hide');
     $('volBox').classList.remove('hide');
     sincronizarPlayer(true);
@@ -454,6 +467,35 @@ async function entrarRadio(){
     $('lojaStatus').textContent = 'Erro de conexão. Toque para tentar de novo.';
     $('btnEntrar').disabled = false;
   }
+}
+
+/* ---------- motor com crossfade: 2 canais de áudio ---------- */
+const pB = document.createElement('audio');
+pB.preload = 'auto';
+document.body.appendChild(pB);
+const players = [audio, pB];
+players.forEach(p=>{ p._key=''; p._url=null; p._carregando=false; });
+let masterVol = 1;
+function setVolume(v){ masterVol = v; if(lojaAtiva) sincronizarPlayer(false); }
+
+/* quais faixas devem estar soando agora (1, ou 2 durante a transição)
+   e com qual volume cada uma */
+function necessarios(pos){
+  const {S, f} = pos.tl;
+  const e = S[pos.index] + pos.seek;
+  const idx = [pos.index];
+  if(pos.index > 0 && e < S[pos.index-1] + (pos.seq[pos.index-1].dur||0))
+    idx.push(pos.index-1);   // anterior ainda terminando (fade out)
+  return idx.map(i=>{
+    const off = e - S[i];
+    const dur = pos.seq[i].dur||0;
+    let vol = 1;
+    const fOut = f[i];
+    if(fOut>0 && off > dur - fOut) vol = Math.max(0, (dur-off)/fOut);
+    const fIn = i>0 ? f[i-1] : 0;
+    if(fIn>0 && off < fIn) vol = Math.min(vol, Math.max(0.02, off/fIn));
+    return { key: pos.ciclo+'-'+i, faixa: pos.seq[i], off, vol };
+  });
 }
 
 function sincronizarPlayer(forcar){
@@ -469,13 +511,12 @@ function sincronizarPlayer(forcar){
     $('nowNext').textContent = '';
     $('nowBadge').classList.add('hide');
     $('barraFill').style.width = '0';
-    audio.pause(); faixaTocandoId = null;
+    players.forEach(p=>{ p.pause(); p._key=''; });
     return;
   }
 
   badge.style.display='flex';
   $('disc').classList.add('spin');
-  $('lojaStatus').textContent = 'No ar agora';
   $('nowTitle').textContent = limparNome(pos.faixa.nome);
   const b = $('nowBadge');
   b.classList.remove('hide','aviso','musica');
@@ -483,20 +524,33 @@ function sincronizarPlayer(forcar){
   b.textContent = pos.faixa.tipo==='aviso' ? '📢 aviso' : '🎵 música';
   const prox = proximaFaixa(pos);
   $('nowNext').textContent = 'A seguir: ' + limparNome(prox.nome);
-  $('barraFill').style.width = (pos.seek/(pos.faixa.dur||1)*100).toFixed(1)+'%';
+  $('barraFill').style.width = (Math.min(1, pos.seek/(pos.faixa.dur||1))*100).toFixed(1)+'%';
 
-  const mudouFaixa = faixaTocandoId !== pos.faixa.id;
-  const drift = Math.abs((audio.currentTime||0) - pos.seek);
+  if(forcar) players.forEach(p=>{ p._key=''; p.pause(); });
 
-  if(forcar || mudouFaixa){
-    faixaTocandoId = pos.faixa.id;
-    fonteTent = fonteOk;
-    carregarAudio(pos);
-  } else if(drift > 3 && !audio.seeking && audio.readyState >= 2){
-    try{ audio.currentTime = pos.seek; }catch(e){}
-  }
-  if(audio.paused && faixaTocandoId && audio.readyState >= 2) audio.play().catch(()=>{});
-  if(!audio.paused && !audio.error) $('lojaStatus').textContent = 'No ar agora';
+  const need = necessarios(pos);
+  const keys = need.map(n=>n.key);
+
+  need.forEach(n=>{
+    let p = players.find(x=>x._key === n.key);
+    if(!p){
+      p = players.find(x=>!keys.includes(x._key));
+      if(!p) return;
+      p._key = n.key;
+      carregarEm(p, n);
+    } else if(!p._carregando){
+      if(p.readyState>=2 && !p.seeking && Math.abs(p.currentTime - n.off) > 3){
+        try{ p.currentTime = n.off; }catch(e){}
+      }
+      if(p.paused && p.readyState>=2) p.play().catch(()=>{});
+    }
+    p.volume = Math.max(0, Math.min(1, masterVol * n.vol));
+  });
+
+  // canais que não fazem mais parte do momento atual
+  players.forEach(p=>{ if(p._key && !keys.includes(p._key)){ p.pause(); p._key=''; } });
+
+  if(players.some(p=>!p.paused && !p.error)) $('lojaStatus').textContent = 'No ar agora';
 }
 
 const CACHE_AUDIO = 'radio-miashop-v1';
@@ -534,33 +588,30 @@ async function obterAudioURL(faixa, avisarStatus){
   finally{ delete baixando[faixa.fid]; }
 }
 
-async function carregarAudio(pos){
-  clearTimeout(watchdogAudio);
+async function carregarEm(p, n){
+  p._carregando = true;
   try{
-    const url = await obterAudioURL(pos.faixa, true);
-    if(faixaTocandoId !== pos.faixa.id){ URL.revokeObjectURL(url); return; }
-    if(urlObjAtual) URL.revokeObjectURL(urlObjAtual);
-    urlObjAtual = url;
-    audio.onloadedmetadata = () => {
-      const p2 = posicaoAtual();
-      if(p2 && p2.faixa.id === faixaTocandoId){
-        try{ audio.currentTime = Math.min(p2.seek, Math.max(0, audio.duration - 0.5)); }catch(e){}
-      }
-      audio.play().then(()=>{ $('lojaStatus').textContent = 'No ar agora'; prefetchProxima(); })
+    const url = await obterAudioURL(n.faixa, true);
+    if(p._key !== n.key){ URL.revokeObjectURL(url); p._carregando = false; return; }
+    if(p._url) URL.revokeObjectURL(p._url);
+    p._url = url;
+    p.onloadedmetadata = () => {
+      p._carregando = false;
+      const pos2 = posicaoAtual();
+      if(!pos2) return;
+      const n2 = necessarios(pos2).find(x=>x.key === p._key);
+      const off = n2 ? n2.off : n.off;
+      try{ p.currentTime = Math.min(off, Math.max(0, p.duration - 0.3)); }catch(e){}
+      p.play().then(()=>{ prefetchProxima(); })
         .catch(()=>{ $('lojaStatus').textContent = '👆 Toque em qualquer lugar para liberar o som'; });
     };
-    audio.src = url;
-    audio.load();
+    p.src = url;
+    p.load();
   }catch(e){
+    p._carregando = false;
+    if(p._key === n.key) p._key = '';
     $('lojaStatus').textContent = '⚠️ Falha ao baixar a faixa — tentando de novo…';
-    setTimeout(()=>{ if(lojaAtiva) sincronizarPlayer(true); }, 8000);
   }
-}
-
-function falhaAudio(){
-  if(!lojaAtiva || !faixaTocandoId) return;
-  const pos = posicaoAtual();
-  if(pos) carregarAudio(pos);
 }
 
 // baixa a próxima faixa em segundo plano para o cache local (troca instantânea)
@@ -572,14 +623,20 @@ function prefetchProxima(){
     obterAudioURL(prox, false).then(u=>URL.revokeObjectURL(u)).catch(()=>{});
 }
 
-// se o navegador bloquear o autoplay, qualquer toque libera
-document.addEventListener('click', ()=>{ 
-  if(lojaAtiva && audio.paused && audio.readyState >= 2) audio.play().catch(()=>{});
+// se o navegador bloquear o autoplay, qualquer toque libera os dois canais
+document.addEventListener('click', ()=>{
+  if(!lojaAtiva) return;
+  players.forEach(p=>{ if(p._key && p.paused && p.readyState >= 2) p.play().catch(()=>{}); });
 });
 
-audio.addEventListener('ended', ()=>{ if(lojaAtiva) sincronizarPlayer(true); });
-audio.addEventListener('error', ()=>{ if(lojaAtiva) falhaAudio(); });
-setInterval(()=>{ if(lojaAtiva) sincronizarPlayer(false); }, 1000);
+players.forEach(p=>{
+  p.addEventListener('ended', ()=>{ if(lojaAtiva) sincronizarPlayer(false); });
+  p.addEventListener('error', ()=>{
+    if(lojaAtiva && p._key){ p._key=''; setTimeout(()=>sincronizarPlayer(false), 3000); }
+  });
+});
+// relógio fino: mantém o crossfade suave e a sincronia apertada
+setInterval(()=>{ if(lojaAtiva) sincronizarPlayer(false); }, 250);
 
 function limparNome(n){ return String(n||'').replace(/\.[a-z0-9]{2,4}$/i,''); }
 
